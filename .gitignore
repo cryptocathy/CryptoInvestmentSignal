@@ -1,0 +1,21 @@
+# Credentials - never commit these
+.env
+
+# Runtime state
+last_run.txt
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.iml
