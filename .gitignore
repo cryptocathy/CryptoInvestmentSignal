@@ -4,6 +4,7 @@
 
 # Runtime state
 last_run.txt
+seen_titles.txt
 logs/
 
 # Python

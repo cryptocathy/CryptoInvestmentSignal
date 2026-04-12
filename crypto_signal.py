@@ -40,6 +40,8 @@ BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 BINANCE_BASE_URL   = "https://api.binance.com"
 MIN_USD_VALUE      = 1.0  # ignore dust balances below $1
+SEEN_TITLES_FILE   = os.path.join(os.path.dirname(__file__), "seen_titles.txt")
+SEEN_TITLES_MAX    = 500  # rolling cache size
 
 # ── News RSS feeds ─────────────────────────────────────────────────────────────
 NEWS_FEEDS = [
@@ -106,6 +108,27 @@ def is_after(pub_str, since_dt):
     if dt is None:
         return True  # include if date unparseable
     return dt >= since_dt
+
+
+# ── Seen-titles dedup cache ────────────────────────────────────────────────────
+
+def load_seen_titles():
+    if os.path.exists(SEEN_TITLES_FILE):
+        with open(SEEN_TITLES_FILE, encoding="utf-8") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+
+def save_seen_titles(seen):
+    # Keep only the last SEEN_TITLES_MAX to prevent unbounded growth
+    titles = list(seen)[-SEEN_TITLES_MAX:]
+    with open(SEEN_TITLES_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(titles))
+
+
+def title_key(title):
+    """Normalize title for dedup comparison."""
+    return re.sub(r"\s+", " ", title.lower().strip())
 
 
 # ── Last-run tracker ───────────────────────────────────────────────────────────
@@ -206,11 +229,22 @@ def fetch_all_items(since_dt):
         print(f"  @{username}: {status}")
         all_items.extend(items)
 
+    # Filter by time window
     in_window = [i for i in all_items if is_after(i["published"], since_dt)]
     elapsed_min = int((datetime.now(timezone.utc) - since_dt).total_seconds() / 60)
-    print(f"\nTotal fetched: {len(all_items)} | Since last run ({elapsed_min}min ago): {len(in_window)}")
+    print(f"\nTotal fetched: {len(all_items)} | In window ({elapsed_min}min): {len(in_window)}")
 
-    return in_window
+    # Dedup against previously seen titles
+    seen = load_seen_titles()
+    new_items = [i for i in in_window if title_key(i["title"]) not in seen]
+    print(f"After dedup: {len(new_items)} new items")
+
+    # Add new titles to seen cache
+    for i in new_items:
+        seen.add(title_key(i["title"]))
+    save_seen_titles(seen)
+
+    return new_items
 
 
 # ── Binance ────────────────────────────────────────────────────────────────────
@@ -323,97 +357,37 @@ def analyze(items, portfolio):
     else:
         items_text = "No items were fetched from any source this run."
 
-    prompt = f"""You are a Crypto Market Monitoring Analyst and Portfolio Advisor. Analyze the news items below alongside the user's Binance portfolio, then produce a signal digest with personalised trading suggestions.
+    prompt = f"""You are a Crypto Market Monitoring Analyst. Be extremely concise — the email must be readable in under 20 seconds.
 
-FETCHED ITEMS:
+NEW ITEMS (published since last scan — do NOT reference anything outside this list):
 {items_text}
 
-USER'S BINANCE PORTFOLIO (read-only — suggestions only, no trades placed automatically):
+USER'S BINANCE PORTFOLIO:
 {portfolio_text}
 
-YOUR TASK:
+RULES:
+- Only use items from the list above. Never invent or recall past signals.
+- Discard Low-strength signals, memes, generic opinion, and duplicate topics.
+- Keep only TOP 3 signals max (Medium/High/Extreme strength only).
+- If no qualifying signals: output exactly: NO_SIGNALS
 
-STEP 1 — FILTER
-Keep only items meeting AT LEAST 2 of:
-- From a credible/influential source (major outlet or known crypto figure)
-- Contains a strong claim, prediction, or breaking news
-- Mentions specific tokens, sectors, or catalysts (BTC, ETH, DeFi, AI tokens, regulation, ETF, rates)
-- High urgency or specificity (price targets, deadlines, votes, rulings, hacks)
-Discard memes, generic takes, reposts of old news, low-signal filler.
+OUTPUT FORMAT (plain text, no markdown, be brief):
 
-STEP 2 — ANALYZE each kept item:
-- Signal Direction: Bullish / Bearish / Neutral
-- Signal Strength: Low / Medium / High / Extreme
-- Signal Type: Narrative Shift / Breaking News / Insider Insight / Macro Impact / Technical Catalyst
-- Affected Assets: list specific tokens or sectors
-- Time Sensitivity: Immediate / Short-term / Medium-term
-- Reasoning: 1 sentence on why this could move the market
+CRYPTO SIGNAL DIGEST — {now_utc}
 
-STEP 3 — PRIORITIZE: Keep only TOP 3-5 signals ranked by (1) market impact, (2) urgency, (3) credibility.
-Only signals with Strength of Medium, High, or Extreme qualify. Discard Low-strength signals entirely.
+Portfolio: [one line, e.g. "BTC $2,563 (83%) | PEPE $397 (13%) | DOT $101 (3%) | Total $3,076"]
 
-STEP 4 — PORTFOLIO SUGGESTIONS
-For each qualifying signal, cross-reference the portfolio and suggest:
-- BUY [asset]: bullish signal + user has USDT available. Include rough % of USDT to deploy (High=20-30%, Extreme=30-50%).
-- SELL [asset] -> USDT: bearish signal + user holds it. Suggest converting to USDT to preserve capital and wait for re-entry.
-- HOLD [asset]: bullish signal, user already holds it well. Suggest holding or small add.
-- WATCH [asset]: signal is relevant but user has no position and no USDT to deploy. Flag for future opportunity.
-Never suggest deploying 100% into one asset.
+SIGNALS
+[#] [Bullish/Bearish] [HIGH/EXTREME/MEDIUM] — [Asset]: [1 sentence what happened]. [BUY x% USDT / SELL->USDT / HOLD / WATCH]
+[repeat, max 3]
 
-STEP 5 — DECIDE whether to send an alert:
-- If NO signals qualify: output exactly one line: NO_SIGNALS
-- If signals exist: output the full email in plain text, no markdown:
+MARKET MOOD: [1 sentence overall take]
 
-============================================================
-CRYPTO MARKET SIGNAL DIGEST
-{now_utc}
-============================================================
+ACTION: [1-2 lines max, most urgent thing to do, or "No action needed"]
 
-PORTFOLIO SNAPSHOT
-Asset    | Qty        | Price (USDT) | Value (USDT) | Allocation
-[one row per asset, aligned]
-Total: $X,XXX USDT
+SUBJECT: CRYPTO SIGNAL: <5 words max>
 
-------------------------------------------------------------
-1. TOP SIGNALS
-[Bullet list 3-5 signals, 1 line each starting with *]
-
-------------------------------------------------------------
-2. SIGNAL DETAILS + TRADE SUGGESTIONS
-
-[Signal #1]
-Source:
-Direction:
-Strength:
-Type:
-Assets:
-Summary:
-Why it matters:
-Time sensitivity:
-Link:
->> SUGGESTED ACTION: [BUY/SELL->USDT/HOLD/WATCH] [asset] - [1 sentence rationale]
-
-[Repeat block for each signal]
-
-------------------------------------------------------------
-3. QUICK TAKE
-[2-3 sentences: overall market interpretation]
-
-------------------------------------------------------------
-4. PORTFOLIO ACTION PLAN
-[Numbered priority list of concrete actions, e.g.:]
-1. Sell ETH -> USDT (bearish signal, you hold $X at risk)
-2. Buy BTC with 25% of USDT (~$X) - strong bullish catalyst
-3. Hold SOL - bullish but already well positioned
-[If nothing to act on: "No portfolio changes suggested this run."]
-
-============================================================
-Sources scanned: CoinDesk, Cointelegraph, The Block, Decrypt, CryptoPanic, Reuters, Investing.com, X/@saylor @VitalikButerin @cz_binance @elonmusk @APompliano @RaoulGMI @woonomic @100trillionUSD @CryptoHayes @novogratz @DocumentingBTC @BitcoinMagazine
-============================================================
-
-SUBJECT: CRYPTO SIGNAL: <3-6 word summary of the top signal>
-
-Output the SUBJECT line as the very last line."""
+Output SUBJECT as the last line."""
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
