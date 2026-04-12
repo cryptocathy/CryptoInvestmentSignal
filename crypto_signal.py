@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Crypto Market Signal Digest
 Fetches crypto news + influential X posts via Nitter RSS, analyzes signals
@@ -13,6 +14,15 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 
+import sys
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import hashlib
+import hmac
+import time
+import urllib.parse
+
 import anthropic
 import requests
 from dotenv import load_dotenv
@@ -26,6 +36,10 @@ GMAIL_PASSWORD     = os.getenv("GMAIL_APP_PASSWORD", "")
 RECIPIENT          = os.getenv("RECIPIENT_EMAIL", "")
 DEFAULT_LOOKBACK   = int(os.getenv("LOOKBACK_MINUTES", "65"))  # fallback for first run
 LAST_RUN_FILE      = os.path.join(os.path.dirname(__file__), "last_run.txt")
+BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+BINANCE_BASE_URL   = "https://api.binance.com"
+MIN_USD_VALUE      = 1.0  # ignore dust balances below $1
 
 # ── News RSS feeds ─────────────────────────────────────────────────────────────
 NEWS_FEEDS = [
@@ -199,10 +213,101 @@ def fetch_all_items(since_dt):
     return in_window
 
 
+# ── Binance ────────────────────────────────────────────────────────────────────
+
+def binance_signed_request(endpoint, params=None):
+    """Make a signed GET request to Binance REST API."""
+    params = params or {}
+    params["timestamp"] = int(time.time() * 1000)
+    query = urllib.parse.urlencode(params)
+    signature = hmac.new(
+        BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256
+    ).hexdigest()
+    url = f"{BINANCE_BASE_URL}{endpoint}?{query}&signature={signature}"
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    r = requests.get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_usdt_prices(symbols):
+    """Fetch current USDT prices for a list of base assets."""
+    prices = {}
+    try:
+        r = requests.get(f"{BINANCE_BASE_URL}/api/v3/ticker/price", timeout=10)
+        all_prices = {p["symbol"]: float(p["price"]) for p in r.json()}
+        for asset in symbols:
+            if asset == "USDT":
+                prices[asset] = 1.0
+            elif f"{asset}USDT" in all_prices:
+                prices[asset] = all_prices[f"{asset}USDT"]
+            elif f"{asset}BTC" in all_prices and "BTCUSDT" in all_prices:
+                prices[asset] = all_prices[f"{asset}BTC"] * all_prices["BTCUSDT"]
+    except Exception as e:
+        print(f"  Price fetch error: {e}")
+    return prices
+
+
+def fetch_binance_portfolio():
+    """Return portfolio as list of dicts with asset, qty, usd_value."""
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        print("  Binance keys not configured — skipping portfolio fetch.")
+        return []
+    try:
+        data = binance_signed_request("/api/v3/account")
+        balances = [
+            b for b in data.get("balances", [])
+            if float(b["free"]) + float(b["locked"]) > 0
+        ]
+        assets = [b["asset"] for b in balances]
+        prices = get_usdt_prices(assets)
+
+        portfolio = []
+        for b in balances:
+            asset = b["asset"]
+            qty = float(b["free"]) + float(b["locked"])
+            price = prices.get(asset, 0)
+            usd_value = qty * price
+            if usd_value >= MIN_USD_VALUE:
+                portfolio.append({
+                    "asset": asset,
+                    "qty": qty,
+                    "price_usdt": price,
+                    "usd_value": usd_value,
+                })
+
+        portfolio.sort(key=lambda x: x["usd_value"], reverse=True)
+        total = sum(p["usd_value"] for p in portfolio)
+        for p in portfolio:
+            p["pct"] = round(p["usd_value"] / total * 100, 1) if total else 0
+
+        print(f"  Portfolio: {len(portfolio)} assets, total ~${total:,.0f} USDT")
+        return portfolio
+    except Exception as e:
+        print(f"  Binance error: {e}")
+        return []
+
+
+def format_portfolio(portfolio):
+    """Format portfolio as plain text for the Claude prompt."""
+    if not portfolio:
+        return "Portfolio unavailable."
+    total = sum(p["usd_value"] for p in portfolio)
+    lines = [f"Total portfolio value: ~${total:,.0f} USDT\n"]
+    for p in portfolio:
+        lines.append(
+            f"  {p['asset']:8s}  qty: {p['qty']:.4f}  "
+            f"price: ${p['price_usdt']:,.4f}  "
+            f"value: ${p['usd_value']:,.2f}  ({p['pct']}%)"
+        )
+    return "\n".join(lines)
+
+
 # ── Analyzer ───────────────────────────────────────────────────────────────────
 
-def analyze(items):
+def analyze(items, portfolio):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    portfolio_text = format_portfolio(portfolio)
 
     if items:
         lines = []
@@ -218,10 +323,13 @@ def analyze(items):
     else:
         items_text = "No items were fetched from any source this run."
 
-    prompt = f"""You are a Crypto Market Monitoring Analyst. Analyze the news items and X posts below.
+    prompt = f"""You are a Crypto Market Monitoring Analyst and Portfolio Advisor. Analyze the news items below alongside the user's Binance portfolio, then produce a signal digest with personalised trading suggestions.
 
 FETCHED ITEMS:
 {items_text}
+
+USER'S BINANCE PORTFOLIO (read-only — suggestions only, no trades placed automatically):
+{portfolio_text}
 
 YOUR TASK:
 
@@ -241,23 +349,37 @@ STEP 2 — ANALYZE each kept item:
 - Time Sensitivity: Immediate / Short-term / Medium-term
 - Reasoning: 1 sentence on why this could move the market
 
-STEP 3 — PRIORITIZE: Keep only TOP 3–5 signals ranked by (1) market impact, (2) urgency, (3) credibility.
+STEP 3 — PRIORITIZE: Keep only TOP 3-5 signals ranked by (1) market impact, (2) urgency, (3) credibility.
 Only signals with Strength of Medium, High, or Extreme qualify. Discard Low-strength signals entirely.
 
-STEP 4 — DECIDE whether to send an alert:
-- If NO signals qualify (all filtered out, or only Low strength): output exactly one line: NO_SIGNALS
-- If signals exist: output the full email body below in plain text, no markdown:
+STEP 4 — PORTFOLIO SUGGESTIONS
+For each qualifying signal, cross-reference the portfolio and suggest:
+- BUY [asset]: bullish signal + user has USDT available. Include rough % of USDT to deploy (High=20-30%, Extreme=30-50%).
+- SELL [asset] -> USDT: bearish signal + user holds it. Suggest converting to USDT to preserve capital and wait for re-entry.
+- HOLD [asset]: bullish signal, user already holds it well. Suggest holding or small add.
+- WATCH [asset]: signal is relevant but user has no position and no USDT to deploy. Flag for future opportunity.
+Never suggest deploying 100% into one asset.
+
+STEP 5 — DECIDE whether to send an alert:
+- If NO signals qualify: output exactly one line: NO_SIGNALS
+- If signals exist: output the full email in plain text, no markdown:
 
 ============================================================
 CRYPTO MARKET SIGNAL DIGEST
 {now_utc}
 ============================================================
 
-1. TOP SIGNALS
-[Bullet list of 3-5 signals, 1 line each starting with •]
+PORTFOLIO SNAPSHOT
+Asset    | Qty        | Price (USDT) | Value (USDT) | Allocation
+[one row per asset, aligned]
+Total: $X,XXX USDT
 
 ------------------------------------------------------------
-2. SIGNAL DETAILS
+1. TOP SIGNALS
+[Bullet list 3-5 signals, 1 line each starting with *]
+
+------------------------------------------------------------
+2. SIGNAL DETAILS + TRADE SUGGESTIONS
 
 [Signal #1]
 Source:
@@ -269,6 +391,7 @@ Summary:
 Why it matters:
 Time sensitivity:
 Link:
+>> SUGGESTED ACTION: [BUY/SELL->USDT/HOLD/WATCH] [asset] - [1 sentence rationale]
 
 [Repeat block for each signal]
 
@@ -277,8 +400,12 @@ Link:
 [2-3 sentences: overall market interpretation]
 
 ------------------------------------------------------------
-4. ACTIONABLE INSIGHT
-[1-2 sentences: specific recommendation]
+4. PORTFOLIO ACTION PLAN
+[Numbered priority list of concrete actions, e.g.:]
+1. Sell ETH -> USDT (bearish signal, you hold $X at risk)
+2. Buy BTC with 25% of USDT (~$X) - strong bullish catalyst
+3. Hold SOL - bullish but already well positioned
+[If nothing to act on: "No portfolio changes suggested this run."]
 
 ============================================================
 Sources scanned: CoinDesk, Cointelegraph, The Block, Decrypt, CryptoPanic, Reuters, Investing.com, X/@saylor @VitalikButerin @cz_binance @elonmusk @APompliano @RaoulGMI @woonomic @100trillionUSD @CryptoHayes @novogratz @DocumentingBTC @BitcoinMagazine
@@ -334,8 +461,11 @@ def main():
 
     items = fetch_all_items(since_dt)
 
+    print("\nFetching Binance portfolio...")
+    portfolio = fetch_binance_portfolio()
+
     print("\nAnalyzing with Claude Haiku...")
-    result = analyze(items)
+    result = analyze(items, portfolio)
 
     # Split body from subject (subject is always last line)
     lines = result.strip().splitlines()
