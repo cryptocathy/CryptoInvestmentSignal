@@ -367,9 +367,9 @@ USER'S BINANCE PORTFOLIO:
 
 RULES:
 - Only use items from the list above. Never invent or recall past signals.
-- Discard Low-strength signals, memes, generic opinion, and duplicate topics.
-- Keep only TOP 3 signals max (Medium/High/Extreme strength only).
-- If no qualifying signals: output exactly: NO_SIGNALS
+- Discard Low and Medium strength signals, memes, generic opinion, and duplicate topics.
+- Keep only TOP 3 signals max — HIGH or EXTREME strength only.
+- If no HIGH or EXTREME signals exist: output exactly: NO_SIGNALS
 
 OUTPUT FORMAT (plain text, no markdown, be brief):
 
