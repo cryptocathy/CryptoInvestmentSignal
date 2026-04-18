@@ -2,10 +2,16 @@
 .env
 .envrc
 
-# Runtime state
+# Runtime state — personal data, PIDs, local order history
 last_run.txt
 seen_titles.txt
 logs/
+*.lock
+pending_orders.json
+dry_run_trades.json
+
+# Claude Code local settings — contains machine-specific paths
+.claude/
 
 # Python
 __pycache__/

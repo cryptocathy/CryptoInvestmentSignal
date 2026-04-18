@@ -1,0 +1,11 @@
+  Start the loop:
+  python monitor.py                  # foreground — output in terminal, Ctrl+C to stop
+  python monitor.py --interval 10    # foreground, every 10 minutes
+  python monitor.py --background     # detached background process
+
+  Stop everything:
+  python monitor.py --stop           # stop monitor only
+  python status.py --stop            # stop monitor + watcher + cancel pending orders
+
+  Check what's running:
+  python status.py                   # shows monitor, watcher, pending orders, recent trades
